@@ -16,6 +16,7 @@ from ..auth.dependencies import nginx_proxied_auth
 from ..repositories.factory import get_federation_config_repository
 from ..repositories.interfaces import FederationConfigRepositoryBase
 from ..schemas.federation_schema import (
+    AiCatalogSourceConfig,
     AwsRegistryConfig,
     FederationConfig,
 )
@@ -69,6 +70,35 @@ def _check_federation_management_scope(
 router = APIRouter()
 
 
+def _validate_federation_endpoints(config: FederationConfig) -> None:
+    """Reject federation configs whose endpoints fail SSRF safety checks.
+
+    The anthropic/asor endpoints are fetched server-side during sync, so an
+    attacker-controlled value (e.g. http://169.254.169.254/) would be an SSRF
+    vector. Validate any non-empty endpoint at write time, reusing the shared
+    ``_is_safe_url`` allowlist (http/https scheme, no private/loopback/link-local
+    or cloud-metadata IPs). Defense-in-depth: sync re-validates before egress.
+
+    Args:
+        config: The federation config being saved.
+
+    Raises:
+        HTTPException: 400 if any configured endpoint is unsafe to fetch.
+    """
+    from ..services.skill_service import _is_safe_url
+
+    for label, section in (("anthropic", config.anthropic), ("asor", config.asor)):
+        endpoint = getattr(section, "endpoint", "") or ""
+        if endpoint and not _is_safe_url(endpoint):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"The {label} endpoint failed SSRF safety validation; "
+                    "private, loopback, link-local, and metadata addresses are not allowed"
+                ),
+            )
+
+
 def _get_federation_repo() -> FederationConfigRepositoryBase:
     """Get federation config repository dependency."""
     return get_federation_config_repository()
@@ -95,6 +125,12 @@ async def get_federation_config(
     Raises:
         404: Configuration not found
     """
+    # Federation config (endpoints, server/agent/registry lists, auth_env_var
+    # references) is operator-level configuration; gate reads with the same
+    # federation-management check as the mutating siblings rather than exposing
+    # the topology to any authed user.
+    _check_federation_management_scope(user_context)
+
     # Set audit action for federation config read
     set_audit_action(
         request,
@@ -165,6 +201,7 @@ async def save_federation_config(
         ```
     """
     _check_federation_management_scope(user_context)
+    _validate_federation_endpoints(config)
 
     # Set audit action for federation config create/update
     set_audit_action(
@@ -251,6 +288,7 @@ async def update_federation_config(
         Updated configuration
     """
     _check_federation_management_scope(user_context)
+    _validate_federation_endpoints(config)
 
     # Set audit action for federation config update
     set_audit_action(
@@ -367,6 +405,9 @@ async def list_federation_configs(
     Returns:
         List of configuration summaries with id, created_at, updated_at
     """
+    # Gated consistently with get_federation_config and the mutating siblings.
+    _check_federation_management_scope(user_context)
+
     logger.info(f"User {user_context['username']} listing federation configs")
 
     configs = await repo.list_configs()
@@ -495,8 +536,6 @@ async def remove_anthropic_server(
                 )
 
                 # Regenerate nginx config
-                from ..core.nginx_service import nginx_service
-
                 from ..core.nginx_service import nginx_reload_scheduler
 
                 nginx_reload_scheduler.mark_dirty()
@@ -980,6 +1019,10 @@ async def sync_federation(
             detail=f"Federation config '{config_id}' not found",
         )
 
+    # Defense-in-depth SSRF check: re-validate endpoints before any outbound
+    # request, in case a config was persisted before write-time validation.
+    _validate_federation_endpoints(config)
+
     try:
         # Import federation clients
         from ..services.federation.anthropic_client import AnthropicFederationClient
@@ -1260,3 +1303,165 @@ async def sync_federation(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Federation sync failed",
         )
+
+
+# ---------------------------------------------------------------------------
+# ARD ai-catalog.json ingestion sources (issue #1296, Phase 3)
+# Mirrors the AWS registry add/remove pattern; manages
+# FederationConfig.ai_catalog.sources, surfaced in the External Registries UI.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/federation/config/{config_id}/ai_catalog/sources",
+    tags=["federation"],
+    summary="Add an ARD ai-catalog.json ingestion source",
+)
+async def add_ai_catalog_source(
+    request: Request,
+    config_id: str,
+    source: AiCatalogSourceConfig,
+    user_context: Annotated[dict, Depends(nginx_proxied_auth)] = None,
+    repo: FederationConfigRepositoryBase = Depends(_get_federation_repo),
+) -> dict[str, Any]:
+    """Add an ai-catalog.json source to the ARD ingestion configuration."""
+    _check_federation_management_scope(user_context)
+
+    if not source.uri and not source.domain:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An ai-catalog source requires either 'uri' or 'domain'",
+        )
+
+    set_audit_action(
+        request,
+        "create",
+        "federation",
+        resource_id=config_id,
+        description=f"Add ARD ai-catalog source {source.source_id}",
+    )
+    logger.info(
+        f"User {user_context['username']} adding ARD ai-catalog source: {source.source_id}"
+    )
+
+    config = await repo.get_config(config_id)
+    if not config:
+        config = FederationConfig()
+
+    for existing in config.ai_catalog.sources:
+        if existing.source_id == source.source_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Source '{source.source_id}' already exists in configuration",
+            )
+
+    config.ai_catalog.sources.append(source)
+    saved_config = await repo.save_config(config, config_id)
+    return {
+        "message": f"Source '{source.source_id}' added to ARD ai-catalog configuration",
+        "config": saved_config.model_dump(),
+    }
+
+
+@router.delete(
+    "/federation/config/{config_id}/ai_catalog/sources/{source_id}",
+    tags=["federation"],
+    summary="Remove an ARD ai-catalog.json ingestion source",
+)
+async def remove_ai_catalog_source(
+    request: Request,
+    config_id: str,
+    source_id: str,
+    user_context: Annotated[dict, Depends(nginx_proxied_auth)] = None,
+    repo: FederationConfigRepositoryBase = Depends(_get_federation_repo),
+) -> dict[str, Any]:
+    """Remove an ai-catalog.json source from the ARD ingestion configuration."""
+    _check_federation_management_scope(user_context)
+
+    set_audit_action(
+        request,
+        "delete",
+        "federation",
+        resource_id=config_id,
+        description=f"Remove ARD ai-catalog source {source_id}",
+    )
+    logger.info(f"User {user_context['username']} removing ARD ai-catalog source: {source_id}")
+
+    config = await repo.get_config(config_id)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Federation config '{config_id}' not found",
+        )
+
+    original_count = len(config.ai_catalog.sources)
+    config.ai_catalog.sources = [
+        s for s in config.ai_catalog.sources if s.source_id != source_id
+    ]
+    if len(config.ai_catalog.sources) == original_count:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Source '{source_id}' not found in configuration",
+        )
+
+    saved_config = await repo.save_config(config, config_id)
+    return {
+        "message": f"Source '{source_id}' removed from ARD ai-catalog configuration",
+        "config": saved_config.model_dump(),
+    }
+
+
+@router.post(
+    "/federation/ai_catalog/sync",
+    tags=["federation"],
+    summary="Trigger ARD ai-catalog ingestion",
+)
+async def sync_ai_catalog(
+    request: Request,
+    source_id: str | None = None,
+    user_context: Annotated[dict, Depends(nginx_proxied_auth)] = None,
+) -> dict[str, Any]:
+    """Trigger ingestion for all enabled ai-catalog sources, or one source_id."""
+    _check_federation_management_scope(user_context)
+
+    from ..services.ard_ingestion_service import get_ard_ingestion_service
+
+    service = get_ard_ingestion_service()
+    cfg = await service.get_config()
+    if not cfg.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ARD ai-catalog ingestion is disabled (set ai_catalog.enabled=true)",
+        )
+
+    if source_id:
+        match = next((s for s in cfg.sources if s.source_id == source_id), None)
+        if match is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Source '{source_id}' not found in configuration",
+            )
+        results = [await service.ingest_source(match, cfg)]
+    else:
+        results = await service.ingest_all()
+
+    return {
+        "message": f"ARD ingestion triggered for {len(results)} source(s)",
+        "results": [r.model_dump() for r in results],
+    }
+
+
+@router.get(
+    "/federation/ai_catalog/status",
+    tags=["federation"],
+    summary="ARD ai-catalog ingestion status",
+)
+async def ai_catalog_status(
+    user_context: Annotated[dict, Depends(nginx_proxied_auth)] = None,
+) -> dict[str, Any]:
+    """Return per-source ARD ingestion state (generation, counts, failures)."""
+    _check_federation_management_scope(user_context)
+
+    from ..services.ard_ingestion_service import get_ard_ingestion_service
+
+    return {"sources": get_ard_ingestion_service().get_status()}
