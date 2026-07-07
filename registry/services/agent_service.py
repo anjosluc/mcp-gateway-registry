@@ -14,6 +14,7 @@ from typing import Any
 from ..repositories.factory import get_agent_repository, get_search_repository
 from ..repositories.interfaces import AgentRepositoryBase, SearchRepositoryBase
 from ..schemas.agent_models import AgentCard
+from ..utils.url_guard import validate_agent_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,16 @@ class AgentService:
 
         Raises:
             ValueError: If agent path already exists
+            UrlValidationError: If the agent url fails SSRF/scheme validation
         """
         path = agent_card.path
+
+        # Fail-closed URL validation on every agent registration path
+        # (dashboard/API, internal register, federation import) before the
+        # agent card is persisted. Rejects non-http(s) schemes and
+        # private/metadata targets unless the operator allowlisted them.
+        if getattr(agent_card, "url", None):
+            validate_agent_url(str(agent_card.url))
 
         if await self._repo.get(path) is not None:
             logger.error(f"Agent registration failed: path '{path}' already exists")
@@ -178,7 +187,14 @@ class AgentService:
 
         Raises:
             ValueError: If agent not found
+            UrlValidationError: If the update sets a url that fails validation
         """
+        # Fail-closed URL validation on edit paths that change the agent url.
+        # Only runs when the update actually carries a url, so health-status
+        # updates are unaffected.
+        if updates.get("url"):
+            validate_agent_url(str(updates["url"]))
+
         existing_agent = await self._repo.get(path)
         if existing_agent is None:
             logger.error(f"Cannot update agent at path '{path}': not found")
@@ -204,6 +220,14 @@ class AgentService:
             logger.error(f"Failed to re-index agent {path}: {e}")
 
         logger.info(f"Agent '{updated_agent.name}' ({path}) updated")
+
+        # Regenerate nginx config if the agent is enabled, since its backend
+        # url may have changed.
+        if await self.is_agent_enabled(path):
+            from ..core.nginx_service import nginx_reload_scheduler
+
+            nginx_reload_scheduler.mark_dirty()
+
         return updated_agent
 
     async def delete_agent(
@@ -229,6 +253,9 @@ class AgentService:
 
         try:
             agent_name = existing_agent.name
+            # Capture enabled state before deletion removes the state record, so
+            # we only regenerate nginx config when a proxied block actually existed.
+            was_enabled = await self.is_agent_enabled(path)
 
             from .search_index_cleanup import remove_from_search_index_with_retry
 
@@ -244,6 +271,13 @@ class AgentService:
             await self._repo.delete(path)
 
             logger.info(f"Successfully deleted agent '{agent_name}' from path '{path}'")
+
+            # Regenerate nginx config so the agent's reverse-proxy block is
+            # removed, but only if it was enabled.
+            if was_enabled:
+                from ..core.nginx_service import nginx_reload_scheduler
+
+                nginx_reload_scheduler.mark_dirty()
             return True
 
         except ValueError:
@@ -276,6 +310,11 @@ class AgentService:
         await self._repo.set_state(path, True)
         logger.info(f"Enabled agent '{agent.name}' ({path})")
 
+        # Regenerate nginx config so the agent's reverse-proxy block is added.
+        from ..core.nginx_service import nginx_reload_scheduler
+
+        nginx_reload_scheduler.mark_dirty()
+
     async def disable_agent(
         self,
         path: str,
@@ -299,6 +338,11 @@ class AgentService:
 
         await self._repo.set_state(path, False)
         logger.info(f"Disabled agent '{agent.name}' ({path})")
+
+        # Regenerate nginx config so the agent's reverse-proxy block is removed.
+        from ..core.nginx_service import nginx_reload_scheduler
+
+        nginx_reload_scheduler.mark_dirty()
 
     async def is_agent_enabled(
         self,

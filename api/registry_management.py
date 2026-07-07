@@ -3745,12 +3745,24 @@ def cmd_user_create_m2m(args: argparse.Namespace) -> int:
 
         logger.info("M2M account created successfully\n")
         print(f"Client ID: {result.client_id}")
-        print(f"Client Secret: {result.client_secret[:8]}...{result.client_secret[-4:]}")
         print(f"Groups: {', '.join(result.groups)}")
         if result.service_principal_id:
             print(f"Service Principal ID: {result.service_principal_id}")
+
+        # The client secret is shown only once and cannot be retrieved later.
+        # Write it to an owner-only (0600) file created atomically so it is not
+        # emitted to stdout/logs (which land in CI, shell history, CloudWatch).
+        secret_file = Path(f".m2m_client_secret_{result.client_id}.txt")
+        fd = os.open(str(secret_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"CLIENT_ID={result.client_id}\n")
+            f.write(f"CLIENT_SECRET={result.client_secret}\n")
+        os.chmod(secret_file, 0o600)  # enforce 0600 even if the file pre-existed
+
         print()
-        print("IMPORTANT: Save the client secret securely - it cannot be retrieved later.")
+        print(f"Client secret written to: {secret_file}")
+        print("IMPORTANT: Save the client secret securely and delete this file after use.")
+        print("It cannot be retrieved later.")
 
         return 0
 
@@ -4192,7 +4204,11 @@ def cmd_group_create(args: argparse.Namespace) -> int:
     """
     try:
         client = _create_client(args)
-        result = client.create_keycloak_group(name=args.name, description=args.description)
+        result = client.create_keycloak_group(
+            name=args.name,
+            description=args.description,
+            create_in_idp=getattr(args, "idp", False),
+        )
 
         logger.info(f"IAM group created successfully: {result.name}")
         print(f"\nGroup: {result.name}")
@@ -6878,6 +6894,11 @@ Examples:
     group_create_parser = subparsers.add_parser("group-create", help="Create a new IAM group")
     group_create_parser.add_argument("--name", required=True, help="Group name")
     group_create_parser.add_argument("--description", help="Group description")
+    group_create_parser.add_argument(
+        "--idp",
+        action="store_true",
+        help="Also create the group in the configured IdP (Keycloak/Entra), not just the local scopes store",
+    )
 
     # Delete IAM group command
     group_delete_parser = subparsers.add_parser("group-delete", help="Delete an IAM group")
